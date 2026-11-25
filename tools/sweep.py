@@ -24,6 +24,7 @@ METRICS = {
     "slowdown": (("requirements", "checked", "step_slowdown.mean_max", "actual"), False),
     "overhead": (("metrics", "overhead", "ratio"), False),
 }
+RUN_TIMEOUT_S = 120
 BOUNDS = {"reliability": 1.0, "slowdown": 2.5, "overhead": 1.30}
 
 
@@ -44,8 +45,12 @@ def run_one(name: str, seed: int, protocol: str) -> dict:
     cmd = [sys.executable, "-m", "transportlab", "run", "--scenario", SCENARIO,
            "--workload", workload_arg(name), "--protocol", protocol,
            "--out", str(out), "--seed", str(seed), "--runner", "ns3"]
-    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     res = {"name": name, "seed": seed, "out": out}
+    try:
+        proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=RUN_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        res["error"] = [f"timed out after {RUN_TIMEOUT_S}s wall clock (timer loop?)"]
+        return res
     try:
         r = json.loads((out / "results.json").read_text())
     except (OSError, json.JSONDecodeError):
@@ -54,6 +59,16 @@ def run_one(name: str, seed: int, protocol: str) -> dict:
     for key, (path, _) in METRICS.items():
         res[key] = dig(r, path)
     res["crashed"] = bool(r.get("crashed_endpoints"))
+    if res["crashed"]:
+        for ep in r["crashed_endpoints"]:
+            try:
+                evs = json.loads((out / f"endpoint-{ep}.json").read_text())
+                evs = evs.get("events", evs) if isinstance(evs, dict) else evs
+                exc = next(e for e in evs if e.get("kind") == "protocol_exception")
+                res["error"] = [f"{ep} in {exc.get('where')}: {exc.get('error')}"]
+                break
+            except (OSError, json.JSONDecodeError, StopIteration, AttributeError):
+                continue
     try:
         links = json.loads((out / "sim-stats.json").read_text())["_links"]
         res["qdrops"] = sum(l.get("queue_drops", 0) for l in links.values())
@@ -101,7 +116,7 @@ def main():
         print(f"{n:<18} {fmt('reliability', row['reliability'])} {fmt('slowdown', row['slowdown'])} "
               f"{fmt('overhead', row['overhead'])} {qd:>7}")
         for r in errs:
-            print(f"    seed {r['seed']}: {'crashed endpoint' if r.get('crashed') else r['error']}  ({r['out']})")
+            print(f"    seed {r['seed']}: {r.get('error') or 'crashed endpoint'}  ({r['out']})")
         failed |= bool(errs) or any(
             row[k] is None or not (row[k] >= b if METRICS[k][1] else row[k] <= b) for k, b in BOUNDS.items())
     sys.exit(1 if failed else 0)

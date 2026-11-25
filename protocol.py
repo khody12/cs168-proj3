@@ -39,10 +39,19 @@ F_ACK = 0x8
 F_END = 0x4
 F_PROBE = 0x2
 
-# Retransmit timer. Sim RTT is 80-100 ms; real units are 100x smaller.
-RTO_INIT_S = 0.25
-RTO_MIN_S = 0.12
-RTO_MAX_S = 2.0
+# Loss recovery. Sim RTT is 80-100 ms; real units are 100x smaller.
+RTO_INIT_S = 0.15          # loss delay before any RTT sample
+PTO_INIT_S = 0.15          # probe timeout before any RTT sample (~1.5 RTT)
+PTO_GRANULARITY_S = 0.002
+PTO_MAX_RTTS = 4           # backoff cap, in RTTs
+TARGET_DELAY_S = 0.0015    # target queueing delay (rate control, M4)
+# Packet-count threshold (0 = off). Off because path jitter reorders packets
+# within a flow and a count threshold then fires spuriously; the time
+# threshold (RACK-style) tolerates reordering up to ~RTT/8.
+PKT_THRESH = 0
+LOSS_TIME_FRAC = 9 / 8     # or if a later one was acked and it is this old
+LOSS_TIME_MIN_S = 0.001
+TIMER_FLOOR_S = 0.0001
 
 _U32 = 1 << 32
 _U24_MAX = (1 << 24) - 1
@@ -156,7 +165,7 @@ class RangeSet:
 # ---------------------------------------------------------------------------
 
 class Seg:
-    __slots__ = ("seq", "msg_id", "offset", "payload", "end", "sent_at", "tx")
+    __slots__ = ("seq", "msg_id", "offset", "payload", "end", "sent_at", "tx", "pn")
 
     def __init__(self, seq, msg_id, offset, payload, end):
         self.seq = seq
@@ -166,6 +175,7 @@ class Seg:
         self.end = end
         self.sent_at = 0.0
         self.tx = 0
+        self.pn = -1          # packet number of the latest transmission
 
     @property
     def hi(self):
@@ -177,12 +187,48 @@ class FlowTx:
         self.dst = dst
         self.next_seq = 0
         self.queue: list[Seg] = []          # packetized, not yet sent
-        self.unacked: dict[int, Seg] = {}   # seq -> segment, in send order
+        self.unacked: dict[int, Seg] = {}   # seq -> segment
         self.cum = 0
         self.srtt: float | None = None
         self.rttvar = 0.0
+        self.latest_rtt = 0.0
         self.backoff = 0
         self.base_owd_us: int | None = None
+        # Loss detection (QUIC-style). Every transmission, including a
+        # retransmission, gets a fresh packet number, so "sent after" is exact.
+        self.next_pn = 0
+        self.largest_acked_pn = -1
+        self.last_send = 0.0
+        self.retx = 0
+
+    def loss_delay(self) -> float:
+        rtt = max(self.srtt or 0.0, self.latest_rtt)
+        return max(LOSS_TIME_MIN_S, LOSS_TIME_FRAC * rtt) if rtt else RTO_INIT_S
+
+    def detect_lost(self, now: float) -> tuple[list[Seg], float | None]:
+        """Segments to declare lost now, and when the next one would be."""
+        lost, nxt = [], None
+        if self.largest_acked_pn < 0:
+            return lost, nxt
+        delay = self.loss_delay()
+        for s in self.unacked.values():
+            if s.pn >= self.largest_acked_pn:
+                continue
+            if (PKT_THRESH and self.largest_acked_pn - s.pn >= PKT_THRESH) \
+                    or now - s.sent_at >= delay - 1e-6:
+                lost.append(s)
+            else:
+                t = s.sent_at + delay
+                nxt = t if nxt is None else min(nxt, t)
+        return lost, nxt
+
+    def pto(self) -> float:
+        if self.srtt is None:
+            base = PTO_INIT_S
+        else:
+            base = self.srtt + max(4 * self.rttvar, PTO_GRANULARITY_S) + TARGET_DELAY_S
+        cap = PTO_MAX_RTTS * (self.srtt or PTO_INIT_S)
+        return min(base * (2 ** self.backoff), max(base, cap))
 
     def packetize(self, msg):
         data = msg.payload
@@ -197,12 +243,8 @@ class FlowTx:
             if end:
                 break
 
-    def rto(self) -> float:
-        base = RTO_INIT_S if self.srtt is None else max(
-            RTO_MIN_S, self.srtt + 4 * self.rttvar, 1.25 * self.srtt)
-        return min(RTO_MAX_S, base * (2 ** self.backoff))
-
     def on_rtt(self, rtt: float):
+        self.latest_rtt = rtt
         if self.srtt is None:
             self.srtt, self.rttvar = rtt, rtt / 2
         else:
@@ -210,7 +252,9 @@ class FlowTx:
             self.srtt = 0.875 * self.srtt + 0.125 * rtt
 
     def on_ack(self, cum: int, sacks) -> int:
-        """Drop acknowledged segments. Returns bytes newly acknowledged."""
+        """Drop acknowledged segments (cumulative or SACKed; the sender keeps
+        its own scoreboard, so a range reported once stays acked). Returns
+        bytes newly acknowledged."""
         if cum > self.cum:
             self.cum = cum
         acked = 0
@@ -218,6 +262,8 @@ class FlowTx:
             s = self.unacked[seq]
             if s.hi <= self.cum or any(l <= s.seq and s.hi <= r for l, r in sacks):
                 acked += len(s.payload)
+                if s.pn > self.largest_acked_pn:
+                    self.largest_acked_pn = s.pn
                 del self.unacked[seq]
         return acked
 
@@ -249,6 +295,11 @@ class MySender(Sender):
         t = self.now()
         s.sent_at = t
         s.tx += 1
+        s.pn = f.next_pn
+        f.next_pn += 1
+        f.last_send = t
+        if s.tx > 1:
+            f.retx += 1
         self.send_datagram(
             pack_data(s.seq, now_us(t), s.msg_id, s.offset, s.payload, s.end, probe),
             to=f.dst)
@@ -266,8 +317,29 @@ class MySender(Sender):
                     nxt.append(f)
             active = nxt
         for f in self.flows.values():
-            if f.unacked and not self.timer_pending("rto:" + f.dst):
-                self.set_timer("rto:" + f.dst, f.rto())
+            self._arm(f)
+
+    def _arm(self, f: FlowTx):
+        """One timer per flow: the earlier of the next time-threshold loss
+        and the probe timeout (measured from the last send)."""
+        name = "pto:" + f.dst
+        if not f.unacked:
+            self.cancel_timer(name)
+            return
+        now = self.now()
+        _, loss_at = f.detect_lost(now)
+        at = f.last_send + f.pto()
+        if loss_at is not None:
+            at = min(at, loss_at)
+        # Floor keeps float rounding from spinning a zero-delay timer.
+        self.set_timer(name, max(TIMER_FLOOR_S, at - now))
+
+    def _recover(self, f: FlowTx) -> bool:
+        """Retransmit everything detection calls lost. True if any."""
+        lost, _ = f.detect_lost(self.now())
+        for s in sorted(lost, key=lambda s: s.seq):
+            self._send_seg(f, s)
+        return bool(lost)
 
     def on_datagram(self, data, addr):
         if len(data) < ACK_HDR or not is_ack(data):
@@ -284,23 +356,24 @@ class MySender(Sender):
             f.base_owd_us = owd
         if f.on_ack(cum, sacks):
             f.backoff = 0
-            if f.unacked:
-                self.set_timer("rto:" + f.dst, f.rto())
-        if not f.unacked:
-            self.cancel_timer("rto:" + f.dst)
+            self._recover(f)
+        self._arm(f)
 
     def on_timer(self, name):
         if name == "flush":
             self._flush()
-        elif name.startswith("rto:"):
+        elif name.startswith("pto:"):
             f = self.flows.get(name[4:])
             if f is None or not f.unacked:
                 return
-            # Timer-only recovery for M1: resend everything still unacked.
-            for s in list(f.unacked.values()):
-                self._send_seg(f, s, probe=True)
-            f.backoff = min(f.backoff + 1, 5)
-            self.set_timer(name, f.rto())
+            if not self._recover(f):
+                # Tail-loss probe: nothing is provably lost, so resend the
+                # newest unacked segment. Its ACK's cum/SACK shows exactly
+                # what else is missing, and detection takes it from there.
+                newest = max(f.unacked.values(), key=lambda s: s.pn)
+                self._send_seg(f, newest, probe=True)
+                f.backoff = min(f.backoff + 1, 6)
+            self._arm(f)
 
     def on_stop(self):
         pass
