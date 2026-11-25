@@ -50,7 +50,10 @@ UDP's.
 which is our whole header and data. A second checksum using the same algorithm
 over the same bytes doesn't catch anything the first one misses. (If we ever
 wanted stronger protection for a real deployment, the right move would be a
-better checksum such as CRC32C, not a duplicate of the same one.)
+better checksum such as CRC32C, not a duplicate of the same one.) The
+simulator also never corrupts packets: they either arrive intact or are
+dropped. So the "corruption" test case in our design doc's test plan can't be
+run, and is dropped; reordering can still be tested.
 
 **Handshake flags (SYN, FIN, RST).** The design doc opened each connection
 with a SYN exchange. In this network the best possible time for a round of
@@ -71,7 +74,10 @@ packets, so these would always be empty. See
 - **Cumulative ACK and SACK blocks**, as designed. The receiver says "I have
   everything up to here" plus a few ranges it has received beyond that, so
   the sender knows exactly what to resend. We'll cap how many SACK blocks an
-  ACK carries (around 4) to keep ACKs small; the count field stays.
+  ACK carries (around 4) to keep ACKs small; the count field stays. The cap is
+  safe because the receiver ACKs every packet: each ACK reports the newest
+  holes, and older holes were already reported by earlier ACKs, which the
+  sender remembers.
 - **Receive window.** The simulator never fills a receiver's memory, but a
   real receiver has limited buffer space, so we keep flow control in the
   design.

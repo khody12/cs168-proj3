@@ -15,6 +15,9 @@ Short, high-level explanations of the two biggest changes:
   sits inside UDP, which fields we dropped and added
 - [CHANGED_HANDSHAKE_DESIGN.md](CHANGED_HANDSHAKE_DESIGN.md): why there's no
   SYN/FIN handshake, and what replaces it
+- [CHANGED_SLOW_START_DESIGN.md](CHANGED_SLOW_START_DESIGN.md): why slow start
+  doesn't work here, and how we pick and pace the starting rate from the
+  topology
 
 The course's setup and run instructions are at the [bottom](#course-setup-and-running).
 

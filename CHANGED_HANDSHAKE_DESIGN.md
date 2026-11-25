@@ -84,6 +84,7 @@ message 1, we can still deliver 2–8 right away because each one is
 self-contained. Only message 1 waits for its retransmission. This problem is
 called head-of-line blocking, and avoiding it is a big reason newer
 protocols (QUIC, Homa) moved to messages or independent streams.
+
 ## Why it's safe to skip
 
 A handshake normally does four jobs. Here, each one is either unnecessary or
