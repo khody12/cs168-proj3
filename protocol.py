@@ -37,7 +37,7 @@ from transportlab.api import Receiver, Sender
 
 # The scenario your team chose: "leo", "datacenter" or "sensor". Gradescope
 # grades your protocol on this scenario, and rejects it while this is empty.
-SCENARIO = ""
+SCENARIO = "datacenter"
 
 
 class MySender(Sender):

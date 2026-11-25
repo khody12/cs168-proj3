@@ -1,4 +1,4 @@
-id: datacenter
+so id: datacenter
 title: Data center backbone, LLM training traffic
 view: clos  # picture used by VIS=1
 view_labels: {rack0: top of rack 0, rack1: top of rack 1, rack2: top of rack 2}
