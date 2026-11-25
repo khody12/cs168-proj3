@@ -1,0 +1,18 @@
+# Random loss (1%) on rack0-spine during every round: SACK, PTO, overhead.
+id: loss_1
+seed: 1
+drain_s: 4
+flows:
+  - pattern: incast
+    src: "sender*"
+    dst: "receiver*"
+    exclude_self: true
+    direction: allreduce
+    start_s: 1.0
+    period_s: 2.0
+    rounds: 5
+    burst_bytes: 28000
+    msg_bytes: 1400
+    deadline_s: 1.5
+events:
+  - {t_s: 0.9, kind: loss_burst, target: "rack0-spine", loss_pct: 1, duration_s: 9.0}

@@ -1,0 +1,17 @@
+# Overhead with 100-byte messages (decides whether we need packing).
+id: small_msgs
+seed: 1
+drain_s: 4
+flows:
+  - pattern: incast
+    src: "sender*"
+    dst: "receiver*"
+    exclude_self: true
+    direction: allreduce
+    start_s: 1.0
+    period_s: 2.0
+    rounds: 5
+    burst_bytes: 5600
+    msg_bytes: 100
+    deadline_s: 1.5
+events: []

@@ -1,0 +1,18 @@
+# Delay jitter causes reordering: no spurious retransmits.
+id: jitter
+seed: 1
+drain_s: 4
+flows:
+  - pattern: incast
+    src: "sender*"
+    dst: "receiver*"
+    exclude_self: true
+    direction: allreduce
+    start_s: 1.0
+    period_s: 2.0
+    rounds: 5
+    burst_bytes: 28000
+    msg_bytes: 1400
+    deadline_s: 1.5
+events:
+  - {t_s: 0.5, kind: delay_change, target: "rack0-spine", delay_ms: 5, jitter_ms: 5}

@@ -1,0 +1,17 @@
+# Fragmentation and reassembly of 64 KB messages.
+id: large_msgs
+seed: 1
+drain_s: 4
+flows:
+  - pattern: incast
+    src: "sender*"
+    dst: "receiver*"
+    exclude_self: true
+    direction: allreduce
+    start_s: 1.0
+    period_s: 2.0
+    rounds: 3
+    burst_bytes: 128000
+    msg_bytes: 64000
+    deadline_s: 1.5
+events: []

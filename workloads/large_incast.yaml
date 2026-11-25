@@ -1,0 +1,17 @@
+# Multi-RTT rounds: feedback loop, no slow-start penalty.
+id: large_incast
+seed: 1
+drain_s: 4
+flows:
+  - pattern: incast
+    src: "sender*"
+    dst: "receiver*"
+    exclude_self: true
+    direction: allreduce
+    start_s: 1.0
+    period_s: 2.0
+    rounds: 5
+    burst_bytes: 140000
+    msg_bytes: 1400
+    deadline_s: 1.5
+events: []
