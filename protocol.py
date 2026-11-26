@@ -1,18 +1,28 @@
-"""Datacenter transport: 0-RTT, message framing, SACK, delay telemetry.
+"""Datacenter transport: 0-RTT, message framing, SACK, delay-based rate control.
 
-The design is in README.md and the CHANGED_*.md notes. Done so far: wire
-format, framing, receiver reassembly, an ACK for every packet, SACK/RACK loss
-detection with tail-loss probes and backoff, and a pacer that starts every
-flow at its topology fair share (CHANGED_SLOW_START_DESIGN.md).
-Not yet: delay-feedback rate control (M4).
+The design is in README.md and the CHANGED_*.md notes. In short:
+  - No handshake: the first packet carries data.
+  - Data packets carry one or more message pieces, so small messages share
+    a packet and its ACK; the receiver delivers each message as soon as its
+    own pieces arrive.
+  - Each flow starts at its fair share of the topology (minus room for ACKs)
+    and is paced out evenly; retransmissions go first.
+  - Receivers report each packet's one-way delay in the ACK. Senders cut
+    their rate when a standing queue builds (endpoint stand-in for HPCC's
+    switch hop records), and carry a slow link's measured rate into the next
+    round.
+  - Loss recovery: RACK detection with an adaptive reordering window, a
+    tail-loss probe timed from each flow's last segment, and two copies of a
+    retransmission when the loss looks random.
 
 Sections:
-  1. constants        incl. the topology the starting rates come from
-  2. codec            pack/unpack for the data and ACK headers
+  1. constants        topology, rate control and loss parameters (each with why)
+  2. codec            pack/unpack for the data (header + frames) and ACK headers
   3. RangeSet         sorted disjoint byte intervals
-  4. FlowTx           per-destination sender state
-  5. MySender         flush -> set rates -> pacer
-  6. MyReceiver
+  4. FlowTx           per-destination sender state, packing, loss detection,
+                      rate controller
+  5. MySender         flush -> pack -> set rates -> pacer; ACKs; probes
+  6. MyReceiver       frames -> reassembly -> deliver; ACK every packet
 """
 
 from __future__ import annotations
@@ -567,8 +577,10 @@ class MySender(Sender):
     def _set_rates(self):
         """Fair share per flow, assuming every server is doing the same
         all-to-all round. Flows to other racks split this sender's slice of
-        the rack->spine link; flows within the rack split the rest of the NIC.
-        Delay feedback (M4) will correct these when the assumption is wrong."""
+        the rack->spine link (minus room for ACKs); flows within the rack
+        split the rest of the NIC. Each flow's start_round() may begin lower,
+        if the last round showed a slow link; delay feedback (on_delay) then
+        cuts the rate during the round when the assumption is wrong."""
         active = [f for f in self.flows.values() if f.queue]
         cross = [f for f in active if f.cross_rack]
         local = [f for f in active if not f.cross_rack]
