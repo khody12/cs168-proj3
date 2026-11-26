@@ -59,9 +59,10 @@ The harness numbers every message in the trial 0, 1, 2, … from one central
 list before the trial starts, so **every message ID is unique across the whole
 trial**, not just between one sender and one receiver.
 
-Our protocol carries that ID in every data packet, along with the offset of
-the packet's bytes within the message, and an END flag on the message's last
-piece. The receiver keeps one "bucket" per message ID. Each packet says which
+Our protocol carries that ID with every piece of a message it sends, along
+with the offset of the piece within the message, and an END flag on the
+message's last piece (one packet can carry pieces of several messages).
+The receiver keeps one "bucket" per message ID. Each piece says which
 bucket it belongs in and where its bytes go. When a bucket is full, the
 message is delivered. Separately, the stream sequence numbers are only our own
 bookkeeping for ACKs, so the sender knows what to resend. The application
@@ -117,7 +118,7 @@ datacenter it would be a trusted internal network.
 ## Why we don't need FIN either
 
 FIN tells the other side "my byte stream is finished" so both ends can clean
-up. We send messages, not one open-ended stream. Each message's last packet
+up. We send messages, not one open-ended stream. Each message's last piece
 carries an END flag, and the receiver delivers the message as soon as all of
 its pieces are in. There's never a stream to close, and the state a receiver
 keeps per sender is small enough to simply keep until the trial ends.
@@ -133,7 +134,8 @@ keeps per sender is small enough to simply keep until the trial ends.
   acknowledged, and anything lost (including a flow's very first packet) is
   resent by the same SACK and retransmit-timer machinery as everything else.
 - **The flags byte is reused.** SYN, FIN and RST are gone; the flags now mark
-  ACKs, a message's END packet, and probe retransmissions.
+  ACKs and probe retransmissions. Each message's END marker lives in its own
+  message entry, since one packet can carry several messages.
 
 ## Real-world precedent
 

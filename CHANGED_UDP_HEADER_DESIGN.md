@@ -73,26 +73,29 @@ packets, so these would always be empty. See
   pair has its own byte stream, and each packet says where its bytes start.
 - **Cumulative ACK and SACK blocks**, as designed. The receiver says "I have
   everything up to here" plus a few ranges it has received beyond that, so
-  the sender knows exactly what to resend. We'll cap how many SACK blocks an
-  ACK carries (around 4) to keep ACKs small; the count field stays. The cap is
+  the sender knows exactly what to resend. We cap how many SACK blocks an
+  ACK carries at 4 to keep ACKs small; the count field stays. The cap is
   safe because the receiver ACKs every packet: each ACK reports the newest
   holes, and older holes were already reported by earlier ACKs, which the
   sender remembers.
 - **Receive window.** The simulator never fills a receiver's memory, but a
   real receiver has limited buffer space, so we keep flow control in the
   design.
-- **The flags byte**, now holding ACK, END and PROBE flags instead of the
+- **The flags byte**, now holding ACK and PROBE flags instead of the
   handshake flags.
 
 ## What we add
 
 - **A send timestamp** on every data packet. This is how we measure
   congestion now that switches can't report it.
-- **Message ID and offset within the message.** Each packet says which
-  message its bytes belong to and where they go. That lets the receiver
-  deliver a message as soon as all of its pieces have arrived, even if an
-  earlier packet was lost, and lets us split large messages across packets.
-  An END flag marks the packet holding a message's last byte.
+- **Message entries ("frames").** After the header, a packet holds one or
+  more entries, each a piece of one message: its message ID, where the piece
+  goes in that message, its length, and an END bit on a message's last piece.
+  That lets the receiver deliver a message as soon as all of its pieces have
+  arrived, even if an earlier packet was lost. A large message is split across
+  packets, and several small messages can share one packet. Without that,
+  100-byte messages each paid for a full header and their own ACK, nearly
+  doubling the bytes on the wire.
 - **In the ACK: the echoed timestamp and the measured one-way delay**, so
   the sender learns both the round-trip time and how long its packet waited in
   queues.
@@ -107,12 +110,15 @@ never carries data. So we use two small headers that share the same first byte
 (the flags):
 
 ```
-Data packet (16 bytes)
-  flags | #SACK      1   ACK flag off; END marks a message's last packet
+Data packet (9-byte header, then one or more 9-byte message entries)
+  flags | #SACK      1   ACK flag off; PROBE marks a tail-loss probe
   sequence number    4   byte offset in this sender→receiver stream
   send timestamp     4   microseconds, shared clock
-  message ID         4
-  offset in message  3
+  each entry:
+    message ID       4
+    offset           3   where this piece goes in its message
+    length | END     2   piece length; top bit set on a message's last piece
+    data             ...
 
 ACK packet (14 bytes + 8 per SACK block)
   flags | #SACK      1   ACK flag on; #SACK = number of blocks that follow
@@ -125,4 +131,5 @@ ACK packet (14 bytes + 8 per SACK block)
 
 For comparison, the design doc's header was 18 bytes before hop records, and a
 packet crossing the spine would have collected 33 more bytes of hop records.
-The new data header is 16 bytes, and the usual ACK is 14.
+A data packet carrying one message now has 18 bytes of header (9 + 9), and the
+usual ACK is 14. A packet of 100-byte messages fits 13 of them.

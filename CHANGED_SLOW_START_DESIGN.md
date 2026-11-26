@@ -74,8 +74,14 @@ share for each of its flows:
   the sender's own link.
 
 With every sender using these shares, the busiest links run full but not
-over, and no queue builds up. On an ordinary round, that alone should come
-close to the best possible time.
+over, and no queue builds up. On an ordinary round, that alone comes within a
+few percent of the best possible time.
+
+**Leaving room for ACKs.** Each rack's link to the spine carries more than
+its outgoing data: it also carries the ACKs for all the data coming *into*
+that rack, about 3% extra. Our first version filled the link 100% with data,
+and on long rounds that extra 3% slowly built a queue until it overflowed. So
+the cross-rack share leaves room for the ACKs.
 
 ## Pacing: spreading packets out
 
@@ -84,6 +90,12 @@ of packets arriving at a switch at once fills its queue even when the
 average rate is fine. So the sender uses a timer to release packets evenly
 spaced at its chosen rate, instead of dumping a whole window at once. That
 keeps the queues near empty.
+
+Two details matter. Retransmissions go out before new data, because a round
+only ends when its last message is complete, and the message with the missing
+piece can't complete until its retransmission arrives. And the sender never
+hands its own network card more than it can send right away, so a
+retransmission can't get stuck behind a backlog there.
 
 ## Is it OK to build the topology in?
 
@@ -112,15 +124,17 @@ traffic can be uneven. This is where the endpoint delay measurements from
 in:
 
 - **Starting rate too high** (say a link slowed down): queueing delay rises,
-  and the sender cuts its rate within about one round trip.
-- **Starting rate too low** (say fewer servers are sending): queueing stays
-  at zero while there's still data to send, so the sender raises its rate
-  quickly.
-- **A flow finishes early:** its share is handed to the flows still sending.
+  and the sender cuts its rate. A short round may be over before that helps,
+  so if the round also lost packets, the next round starts at the rate the
+  slow link actually delivered.
+- **Starting rate too low** (say fewer servers are sending): we stay at the
+  fair share and don't try to go faster. An empty queue can't tell us whether
+  there's room, and in this network an overshoot overflows a queue before
+  the feedback arrives.
 
 Starting too low is the cheaper mistake: it costs a little time, while
-starting too high costs drops and retransmissions. So the starting rate leans
-toward the safe side.
+starting too high costs drops and retransmissions. So the rate never goes
+above the fair share.
 
 ## Real-world precedent
 

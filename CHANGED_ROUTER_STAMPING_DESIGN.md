@@ -5,10 +5,11 @@ Ellis O'Dowd, Eric Khodorenko
 **Summary:** switches can't write anything into our packets, so we can't use
 HPCC's hop records. Instead, every packet carries a send timestamp. All hosts
 share one clock, so the receiver can see exactly how long each packet waited
-in queues, and it reports that back in the ACK. The sender slows down when
-queueing goes up and speeds up when it's near zero. The idea is still HPCC's:
-learn the load from every packet and react before anything is dropped. Only the
-source of the information has changed.
+in queues, and it reports that back in the ACK. The sender cuts its rate when
+queueing builds, climbs back when it clears, and remembers a slow link from one
+round to the next. The idea is still HPCC's: learn the load from every packet
+and react before anything is dropped. Only the source of the information has
+changed.
 
 The implementation details are in [README.md](README.md).
 
@@ -57,14 +58,49 @@ queueing delay converts directly into roughly how many packets were waiting
 ahead of ours. That's very close to the "queue length" HPCC would have read
 from a hop record.
 
-The receiver puts this number in every ACK. The sender reacts in two ways:
+The receiver puts this number in every ACK, and the sender reacts:
 
-- **Queueing is low (near zero):** there's room, so send faster.
-- **Queueing rises past a small target:** slow down, and cut harder the further
-  over the target it is.
+- **Queueing rises past a small target** (about half a switch queue): cut the
+  rate, harder the further over target it is, at most once per round trip.
+- **Queueing is back near zero and there's still data to send:** climb back
+  up, slowly, but never above the flow's fair share from the topology (see
+  [CHANGED_SLOW_START_DESIGN.md](CHANGED_SLOW_START_DESIGN.md)).
 
 That's the same shape as HPCC's reaction, and it acts before queues overflow,
-not after packets are lost.
+not after packets are lost. Climbing back is deliberately cautious: by the
+time an ACK reports a queue, the network is a full round trip further along,
+and the switch queues are tiny. Any overshoot overflows a queue before the
+sender can hear about it.
+
+## Telling a real queue from noise
+
+Delay can rise for reasons that aren't congestion. Our tests include links
+with random delay "jitter", where each packet is held up by a random amount.
+Our first version cut the rate whenever any single packet looked delayed, and
+jitter alone collapsed the rates to almost nothing.
+
+The fix is to look at the *smallest* queueing delay among the last few
+packets. Jitter delays packets at random, so at least one of a handful usually
+gets through quickly and the minimum stays low. A real queue delays *every*
+packet behind it, so the minimum rises with it. (The Copa congestion control
+uses the same filter.)
+
+## Remembering a slow link
+
+Most rounds finish sending before the first ACK comes back, so a round can't
+fix its own rate in time. If a link is slow for good, every round would start
+too fast and overflow it again. So the sender carries what it learned into the
+next round:
+
+- If a round both **cut the rate** and **lost packets** (a real overflow, not
+  jitter, which never drops anything), the next round starts at the rate
+  the bottleneck actually delivered this flow's packets.
+- That rate comes from the ACKs: while a queue is backed up, it releases this
+  flow's packets at exactly the flow's share of the slow link, so the ACKs
+  come back at that rate. This is the same quantity HPCC reads from its
+  `txBytes` field, measured from the ends.
+- The carried rate creeps back up only after a few clean rounds in a row,
+  because a link that's exactly full looks the same as one with room to spare.
 
 ## But how do we know *where* the congestion is?
 
@@ -87,19 +123,15 @@ broken down per switch. In practice that matters less than it sounds:
 
 **We can't see spare capacity.** A link that's half used and a link that's
 exactly full both have empty queues, so they look the same to us. HPCC could
-tell them apart. We make up for it in two ways:
+tell them apart. We handle this by **starting at a sensible rate**: we know
+the topology and every link's speed (from the scenario file), so each flow
+starts at its fair share of the busiest link instead of guessing or using slow
+start. The cost: we never go above that share, so when fewer servers are
+sending than expected, some capacity goes unused. That's the cheaper mistake,
+since going too fast costs drops and retransmissions.
 
-- **Start at a sensible rate.** We know the topology and every link's speed
-  (from the scenario file), so each sender starts each flow at its fair share
-  of the busiest link, instead of guessing or using slow start. This is
-  important because most rounds are short enough to finish before the first
-  feedback arrives. See
-  [CHANGED_SLOW_START_DESIGN.md](CHANGED_SLOW_START_DESIGN.md).
-- **Probe upward quickly.** If queueing stays at zero and we still have data to
-  send, we raise the rate fast until queues just start to form.
-
-**Feedback is one round trip old.** That's also true of HPCC, which is another
-reason the starting rate matters so much.
+**Feedback is one round trip old.** That's also true of HPCC, and it's why the
+starting rate and the carried-over rate matter so much.
 
 ## Is this a real approach?
 
@@ -114,13 +146,8 @@ mixes in delays on the ACK's return path.
 
 ## What changes in the packet
 
-- **Removed:** the hop count, the hop records, and the ACK's echoed copies of
-  them.
-- **Added to data packets:** a 4-byte send timestamp.
-- **Added to ACKs:** the echoed send timestamp (so the sender can measure round
-  trip time) and the one-way delay the receiver measured.
-
-The result is smaller than the original design. A packet crossing the spine
-would have picked up three hop records, 33 bytes in all. The timestamps cost a
-few bytes. The full header layout is in
-[CHANGED_UDP_HEADER_DESIGN.md](CHANGED_UDP_HEADER_DESIGN.md).
+The hop count, hop records, and the ACK's echoed copies are gone. Data packets
+gain a 4-byte send timestamp; ACKs gain the echoed timestamp (for round-trip
+time) and the one-way delay the receiver measured. That's a few bytes, against
+the 33 bytes of hop records a packet crossing the spine would have collected.
+The full layout is in [CHANGED_UDP_HEADER_DESIGN.md](CHANGED_UDP_HEADER_DESIGN.md).

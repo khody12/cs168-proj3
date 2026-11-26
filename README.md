@@ -2,12 +2,14 @@
 
 Ellis O'Dowd, Eric Khodorenko
 
-This README is our implementation plan. It starts from our design document
-(an HPCC-style protocol with SACK and immediate acks) and changes it where the
-simulator, the topology, or the grading math call for it. Each change is
-explained in [section 3](#3-what-changes-from-the-design-doc-and-why).
+This README describes our protocol as built, in implementation detail. It
+starts from our design document (an HPCC-style protocol with SACK and
+immediate acks) and changes it where the simulator, the topology, or the
+grading math call for it. Each change is listed in
+[section 3](#3-what-changes-from-the-design-doc-and-why); current results are
+in [section 8](#8-test-plan-and-current-results).
 
-Short, high-level explanations of the two biggest changes:
+Short, high-level explanations of the biggest changes:
 
 - [CHANGED_ROUTER_STAMPING_DESIGN.md](CHANGED_ROUTER_STAMPING_DESIGN.md): why
   switches can't stamp hop records, and how endpoints measure congestion instead
@@ -97,18 +99,18 @@ drops is a retransmission (overhead) and probably an extra RTT on the tail
 
 ## 3. What changes from the design doc, and why
 
-| Design doc | Plan | Why |
+| Design doc | What we built | Why |
 |---|---|---|
-| Switches stamp hop records (switch ID, qlen, txBytes, BW) into packets, HPCC-style | **Endpoints measure one-way queueing delay** with the shared clock, and the receiver echoes it in acks | ns-3 switches here are plain drop-tail routers (`sim/tlsim.cc`). Only `protocol.py` runs, and only on hosts, so nothing can write hop records en route. Every host shares one clock (`self.now()` is "the same clock on every host"), so `receiver_now − send_ts` is the exact forward one-way delay. Subtracting the base delay gives the total queueing on the path, which serves as our telemetry. |
-| SYN / SYN-ACK / FIN handshake (timing diagram) | **0-RTT, connectionless.** The first packet of a flow carries data. No FIN. | A handshake adds 100 ms to a 55 ms ideal, which alone is a slowdown of about 2.8 (fact 1). Flow state is created when the first packet arrives. Every message ID is globally unique, so we don't need connection setup to tell flows apart. |
-| Slow start, then ramp quickly | **Start at a topology-aware fair-share rate, paced from the first packet**, then adjust with delay feedback | Fact 3: most rounds are over before slow start would get going. Section 5.3 has the details. |
-| Byte-offset sequence numbers + cumulative ACK + SACK | **Kept** | Works as designed. Retransmissions reuse their byte range and carry a fresh send timestamp, so delay samples stay unambiguous. |
+| Switches stamp hop records (switch ID, qlen, txBytes, BW) into packets, HPCC-style | **Endpoints measure one-way queueing delay** with the shared clock; the receiver echoes it in every ACK, and the sender's rate controller acts on it (§5.3) | ns-3 switches here are plain drop-tail routers (`sim/tlsim.cc`). Only `protocol.py` runs, and only on hosts, so nothing can write hop records en route. Every host shares one clock, so `receiver_now − send_ts` is the exact forward one-way delay; subtracting the base delay gives the queueing on the path. See [CHANGED_ROUTER_STAMPING_DESIGN.md](CHANGED_ROUTER_STAMPING_DESIGN.md). |
+| SYN / SYN-ACK / FIN handshake (timing diagram) | **0-RTT, connectionless.** The first packet of a flow carries data. No FIN. | A handshake adds 100 ms to a 55 ms ideal, which alone is a slowdown of about 2.8 (fact 1). See [CHANGED_HANDSHAKE_DESIGN.md](CHANGED_HANDSHAKE_DESIGN.md). |
+| Slow start, then ramp quickly | **Start at a topology fair-share rate (minus room for ACKs), paced from the first packet.** Delay feedback can only lower it. | Fact 3: most rounds are over before slow start would get going. See [CHANGED_SLOW_START_DESIGN.md](CHANGED_SLOW_START_DESIGN.md) and §5.3. |
+| Byte-offset sequence numbers + cumulative ACK + SACK | **Kept** on the wire. The sender also numbers each *transmission* internally (never sent) to know which was sent later. | Works as designed. Retransmissions reuse their byte range and carry a fresh send timestamp, so delay samples stay unambiguous. |
 | Source/dest ports, checksum | **Dropped** | The harness only sends UDP, and UDP's header already carries ports and a checksum covering our whole header and payload. See [CHANGED_UDP_HEADER_DESIGN.md](CHANGED_UDP_HEADER_DESIGN.md). |
 | Receive window | **Kept, in ACKs only** | Never binding in the simulator, but a real receiver needs flow control. |
-| Up to 15 SACK blocks × 8 B | **Same format; the receiver includes at most `MAX_SACK` (≈ 4)** | We ACK every packet, so older holes were already reported in earlier ACKs. Fewer blocks keep ACKs small during loss. |
+| Up to 15 SACK blocks × 8 B | **Same format; the receiver includes at most `MAX_SACK` = 4** | We ACK every packet, so older holes were already reported in earlier ACKs. Fewer blocks keep ACKs small during loss. |
 | One header for data and ACKs | **Separate data and ACK headers** sharing the flags byte | Senders and receivers are separate endpoints, so data packets never carry ACK info and ACKs never carry data. |
-| Immediate ack for every packet | **Kept for v1.** Measure afterwards, and possibly move to ack-every-2 plus immediate acks on gaps and message ends | Costs about 3% overhead (section 6). We have the budget, and fresh delay samples help congestion control. |
-| One message per packet (implied) | **Each packet carries `msg_id` + offset in message + END flag** | Large messages are split across datagrams (1472 B limit), and a message is delivered as soon as all its pieces arrive, even if an earlier packet is missing. Packing several small messages into one datagram is a possible later extension (section 6). |
+| Immediate ack for every packet | **Kept** | Costs about 3% overhead (§6). We have the budget, and every ACK is a fresh delay sample for the rate controller. Ack-every-2 hasn't been needed. |
+| One message per packet (implied) | **Packets carry "frames"**: one or more `(msg_id, offset, length, END)` pieces | Small messages share a packet's headers and its ACK (100-byte messages: overhead 1.86 → 1.16). Large messages are split across packets. Each message is delivered as soon as its own pieces arrive. |
 
 What we keep from the doc: the **core idea**. Senders learn queue state from
 the path, receivers echo it in every ACK, and senders set their rate from it
@@ -131,27 +133,37 @@ SACK count, the same layout as the design doc's flags/#SACK fields.
 | Flag | Meaning |
 |---|---|
 | `ACK` | this is an ACK packet (otherwise it's data) |
-| `END` | data: this packet holds the last byte of its message |
-| `PROBE` | data: sent by the tail-loss/RTO timer, so the receiver acks immediately (it always does anyway) |
-| (spare) | reserved, 0 |
+| `PROBE` | data: sent by the tail-loss probe timer |
+| (2 spare) | reserved, 0 |
 
-### 4.1 Data packet: 16-byte header
+A message's END marker is not a packet flag; it's the top bit of each frame's
+length (§4.1), because one packet can hold the ends of several messages.
+
+### 4.1 Data packet: 9-byte header + frames
 
 | Field | Bytes | Description |
 |---|---|---|
 | flags \| #SACK | 1 | `ACK` = 0; #SACK = 0 |
-| sequence number | 4 | byte offset of this payload in the sender→receiver stream (as in the design doc) |
+| sequence number | 4 | byte offset of this packet's first data byte in the sender→receiver stream (as in the design doc). The stream counts frame *data* bytes only |
 | send timestamp | 4 | µs, when the sender called `send_datagram`. A retransmission gets a fresh timestamp |
+| **frame** × n | 9 + data | one piece of one message, repeated until the packet is full |
+
+Frame:
+
+| Field | Bytes | Description |
+|---|---|---|
 | msg_id | 4 | the harness's message ID (globally unique) |
-| offset in message | 3 | where this payload goes in the message (messages ≤ 16 MB) |
+| offset in message | 3 | where this piece goes in its message (messages ≤ 16 MB) |
+| length \| END | 2 | bits 0–14: data length; bit 15 (`END`): this piece holds the message's last byte, so `offset + length` is its total size |
+| data | length | |
 
-Payload length = datagram length − 16. When the `END` packet arrives, the
-receiver knows the message's total length: `offset + payload length`. Room
-for 1456 bytes of payload, so a 1400-byte message fits in one datagram.
+Packing (sender, at flush): each flow's pending messages are packed in offer
+order into datagrams of up to 1472 B. A large message is split across
+packets, and a small one may straddle the boundary between two packets. A new
+frame isn't started in less than 64 B of room (`MIN_FRAME_DATA`).
 
-Each flow's byte stream is its messages laid end to end. A packet never spans
-two messages: when a message's last piece is smaller than a full datagram, the
-next message starts in a new packet.
+Sizes: a lone 1400-byte message costs an 18-byte header (9 + 9); one frame can
+carry up to 1454 B. 100-byte messages fit 13 to a packet (109 B each).
 
 ### 4.2 ACK packet: 14 bytes + 8 per SACK block
 
@@ -162,7 +174,7 @@ next message starts in a new packet.
 | receive window | 2 | free buffer space in 256-byte units (as in the design doc) |
 | echo timestamp | 4 | send timestamp of the data packet that triggered this ACK, for RTT |
 | forward OWD | 3 | µs, `receiver.now() − send_ts` for that packet. **Replaces the echoed hop records** |
-| SACK block × n | 8 | `(left, right)` byte offsets of a received range above the cumulative ACK, newest first |
+| SACK block × n | 8 | `(left, right)` byte offsets of a received range above the cumulative ACK; the block holding the triggering packet first, then highest first |
 
 The usual ACK is 14 B, or 42 B on the wire. The doc's version was
 18 + 8k + 33 bytes of echoed hop records.
@@ -173,115 +185,156 @@ The usual ACK is 14 B, or 42 B on the wire. The doc's version was
 
 - A **flow** is one (sender endpoint → receiver) pair. Each sender has at most
   8 flows.
-- Sender state per flow: next stream byte (sequence number); queue of messages
-  not yet sent; sent-and-unacked segments `seq → (msg_id, offset, len,
-  send_time)`; SACK scoreboard (byte ranges the receiver has reported); rate;
-  base OWD (minimum seen); srtt/rttvar; loss/probe timer deadline.
+- Sender state per flow:
+  - **data:** messages offered but not yet packed; packed segments not yet
+    sent; sent-and-unacked segments `seq → (frames, send time, packet
+    number)`; a retransmission queue.
+  - **rate:** this round's fair share, current rate, a rate carried over from
+    a congested round, the next time the pacer may send for this flow, recent
+    queueing-delay samples, the windowed minimum one-way delay.
+  - **timing:** srtt / rttvar / latest / min RTT, whether reordering has been
+    seen, spurious-retransmission count, probe backoff.
 - Receiver state per source address: received stream bytes as a range set
-  (gives the cumulative ACK and the SACK blocks); per message, a `bytearray`
-  plus received byte intervals; the set of completed `msg_id`s (also checked
-  with `self.delivered(msg_id)`).
+  (gives the cumulative ACK and the SACK blocks); per message, its pieces plus
+  received byte intervals; the set of completed `msg_id`s (also checked with
+  `self.delivered(msg_id)`).
 
-### 5.2 Sending: gather, packetize, pace
+### 5.2 Sending: gather, pack, pace
 
-1. `on_app_data` appends the message to its flow's queue and sets a
+1. `on_app_data` adds the message to its flow's pending list and sets a
    **0-delay "flush" timer**. All messages of a round are offered at the same
    simulated instant, so this lets us see the whole round before choosing a
-   send order. If we sent on each call instead, whichever destination came first
-   in offer order would get an unfair head start.
-2. The **packer** turns each flow's queue into datagrams of up to 1472 B,
-   assigning each the next range of stream sequence numbers. Large messages
-   are split into multiple packets; a packet never spans two messages.
-3. The **pacer** is one timer per sender. At each tick it sends the next
-   datagram from the flow that is furthest behind its rate (virtual-time
-   fair queuing over per-flow rates). Retransmissions jump the queue. The tick
-   interval is `wire_bytes / aggregate_rate`, capped at NIC line rate.
-4. Inflight cap per flow: `rate × (base_RTT + 2·target_delay)`. This stops a
-   flow from dumping its backlog during a blackout.
+   send order.
+2. **Flush** packs each flow's pending messages into segments (§4.1), sets
+   each active flow's rate for the round (§5.3), and starts the pacer.
+3. **The pacer** is one `"pace"` timer per sender. Each flow has a `next_send`
+   time; after sending a datagram it moves forward by
+   `wire_bits / flow_rate`. On each tick the pacer sends:
+   - first, any flow's queued **retransmission**: a round ends when its last
+     message completes, and the message with the hole can't complete until
+     its retransmission arrives;
+   - otherwise, new data from the flow whose `next_send` is earliest and due.
+4. **The NIC never gets a backlog.** The sender tracks when its NIC will finish
+   the last datagram it was handed (`nic_free_at`, at 100 Mbps) and doesn't
+   hand it another before then. The NIC's own 1000-packet queue stays empty,
+   so a retransmission can't get stuck behind new data there.
 
 ### 5.3 Rate control (our endpoint-only HPCC)
 
-**Initial rate (the prior).** We know the topology, so the first RTT is paced
-at the share each flow would get if every server were doing all-to-all:
+**Starting rate (the prior).** At each flush, each active flow gets the share
+it would get if every server were doing all-to-all:
 
-- cross-rack: the rack uplink (150 Mbps) is shared by 3 senders → 50 Mbps per
-  sender → split over its active remote flows (≈ 8.3 Mbps each for 6)
-- intra-rack: the rest of the NIC (50 Mbps) → split over its active local flows
-  (25 Mbps each for 2)
+- **cross-rack:** this sender's slice of its rack's 150 Mbps link to the
+  spine, shared by 3 senders, **minus room for ACKs**: that link also carries
+  the ACKs for all data coming into the rack, about 3% extra
+  (`ACK_SHARE` = 42 B per 1500 B). So `150 / 3 / 1.029 ≈ 48.6 Mbps`, split
+  over the active cross-rack flows (≈ 8.1 Mbps each for 6).
+- **intra-rack:** the rest of the NIC (≈ 51.4 Mbps), split over the active
+  same-rack flows (≈ 25.7 Mbps each for 2).
 
-Check: every receiver then gets 6 × 8.3 + 2 × 25 = 100 Mbps, exactly its
-downlink. Every rack↔spine link carries exactly 150 Mbps. **The prior alone
-should land within a few percent of the ideal on uniform all-to-all rounds.**
-The rack of a host is `index // 3`, read from the peer name.
+The rack of a host is `index // 3`, read from its name. Without the ACK room,
+long rounds overloaded the spine links by ~3% and slowly overflowed them
+(large_incast: 62 drops, slowdown 1.73; with it: 0 drops, 1.05).
 
-**Feedback (corrects the prior when it's wrong).** Cases: bandwidth changes,
-failed servers, staggered starts (`jitter_s`), uneven patterns. Per flow, on
-every ACK:
+**Feedback, on every ACK** (`FlowTx.on_delay`):
 
 ```
-q   = fwd_owd − base_owd          # queueing on the forward path (sum over hops)
-T   = target queueing delay        # start ~1.5 ms (≈ 20 pkts at 150 Mbps; queues hold 64)
+base   = min one-way delay over the last ~10 s (two 5-s buckets, follows delay_change)
+q_raw  = this packet's one-way delay − base
+q      = min(q_raw over the last 6 ACKs, within one RTT)     # "standing" queue delay
 
-if q < T:      rate += AI_STEP · (acked_bytes / rate·RTT)          # additive, ~+1 Mbps per RTT
-               if q ≈ 0 for a whole RTT and backlog remains: rate *= 1.25   # fast probe up
-if q > T:      at most once per RTT: rate *= max(0.5, 1 − β·(q − T)/q)      # Swift-style MD
-on loss:       at most once per RTT: rate *= 0.7
-clamp rate to [0.5 Mbps, 100 Mbps]
+if q > T (2.5 ms, about half a spine queue):
+    at most once per RTT:  rate *= max(0.5, 1 − 0.8·(q − T)/q)
+elif data is waiting and rate < share:
+    rate += 0.1 Mbps per RTT (spread over the ACKs)          # never above share
+rate stays within [0.5 Mbps, share]
 ```
 
-This works like HPCC: a multiplicative cut that grows with how far over target
-the path is, reacting to queue buildup well before any drop. HPCC reads per-hop
-qlen/txBytes; we read the total path queueing delay. We usually have a single
-bottleneck, so the two signals carry nearly the same information.
+- **Why a standing minimum, not each sample:** path jitter delays individual
+  packets at random, so one of 6 usually gets through quickly and the minimum
+  stays near zero. A real queue delays every packet, so the minimum rises with
+  it. This is Copa's filter. Counted rather than timed, because a round's ACKs
+  arrive within ~30 ms: a time window kept the early, pre-queue samples all
+  round and never saw the queue.
+- **Why never above the share, and why climbing back is slow:** feedback is
+  one RTT (~100 ms) old, and queues hold ~5 ms. Any overshoot above capacity
+  overflows a queue before the sender can hear about it.
 
-`base_owd` is the windowed minimum (last ~5 s) of the forward OWD, starting from
-the topology values (40 / 50 ms). The window lets the protocol follow
-`delay_change` events.
+**Across rounds: remembering a slow link** (`FlowTx.start_round`). Rounds are
+seconds apart and usually shorter than an RTT, so a round can't fix its own
+rate in time. If the previous round both **cut the rate** and had **real
+losses** (retransmissions, not counting spurious ones), the next round starts
+at the **measured delivery rate**:
 
-**Across rounds.** Rounds are seconds apart. At the start of a round, each flow
-goes back to the prior, blended toward the rate it ended the last round at if
-that round saw sustained congestion (a lasting `bw_change`, for example).
+- bytes acked ÷ time over the longest contiguous run of ACKs whose packets saw
+  `q_raw > T` (≥ 4 ACKs; a gap longer than 4 packets' time ends a run);
+- while a queue is backed up, it releases this flow's packets at exactly its
+  share of the bottleneck. This is the quantity HPCC reads from `txBytes`.
+
+The carried rate creeps back up (×1.1 per round) only after 3 clean rounds in
+a row, because a link that's exactly full looks the same as one with room to
+spare.
+
+Alternatives we tried and dropped (each measured on the sweep):
+
+| Tried | Problem |
+|---|---|
+| React to each packet's delay | jitter looked like queueing: rates collapsed to the floor and the cuts carried forward (jitter: 1.07 → 4.40) |
+| Standing minimum over a time window | missed queues that build within a short round (slow_spine: 2.98) |
+| Carry the mildly cut rate | took ~4 rounds to settle on a slow link, losing packets each round |
+| Delivery rate = a round's bytes ÷ its whole ACK span | the loss-recovery tail stretched the span: ~10× too low |
+| Delivery rate = max over groups of 8 ACKs | captured the pre-queue ACKs at our own send rate: no reduction at all |
+| Relax the carried rate after every clean round | re-overloaded a permanently slow link every other round |
+| Carry on any retransmission | spurious retransmissions under jitter counted as loss (jitter: 1.08 → 1.61) |
 
 ### 5.4 Loss recovery
 
-- **SACK-based fast retransmit.** A segment is declared lost once at least 3
-  segments sent after it are covered by the cumulative ACK or SACK blocks, or
-  once a later segment is acked and this one is more than `9/8 · srtt` old
-  (QUIC's time threshold, which tolerates jitter reordering). It is resent
-  ahead of new data with the **same sequence number and a fresh send
-  timestamp**, so delay samples from retransmissions stay accurate.
-- **Tail loss probe / RTO.** The last packets of a round have nothing after
-  them to trigger SACK detection, and the tail is exactly what step time
-  measures. The probe timer fires at
-  `PTO = srtt + max(4·rttvar, 2 ms) + target_delay`, which is about 1.1 × RTT
-  (≈ 110 ms in sim, ≈ 1.1 ms real). TCP's 200 ms+ minimum RTO would be about
-  200 RTTs in real units. On a PTO, resend the **newest** unacked segment with
-  the `PROBE` flag. Its ACK's cumulative ack and SACK blocks show exactly which
-  earlier segments are missing.
-- **Backoff during outages.** Consecutive PTOs double, capped at 4 × RTT.
-  During a blackout, each flow sends at most one probe per backoff interval, so
-  a dead server costs a few probes, not a window of retransmits. As soon as an
-  ack arrives, the timer resets to its normal value and the rate returns to the
-  prior.
-- **Optional, only if tests show we need it: tail redundancy.** If the flow has
-  seen random loss recently (a `loss_burst`), send the last datagram of each
-  flow's round twice. Duplicating a tail packet with 4 packets per pair costs
-  about 25% overhead, so this is only turned on after loss has been observed.
+- **RACK-style detection (RFC 8985).** Every transmission gets an internal
+  packet number. A segment is lost once a segment *sent after it* has been
+  acked and it's older than `latest_rtt + reo_wnd + 1 ms`.
+  - `reo_wnd` is **0 until reordering is seen**. A flow's packets share one
+    FIFO path, so without reordering, a later packet's ACK proves an earlier
+    one is lost, and the retransmission goes out as soon as that ACK arrives.
+  - **Reordering is seen** when a never-retransmitted segment is acked after a
+    later one, or a retransmission is "acked" faster than `0.8 · min_rtt`
+    (so the original arrived late, and the retransmission was spurious).
+    Then `reo_wnd = min(srtt, min_rtt / 4)`, as in RACK.
+  - Packet-count thresholds are off: jitter reordering made them fire falsely.
+- **Retransmissions** wait in the flow's retransmission queue and the pacer
+  sends them before new data, with the **same sequence number and a fresh send
+  timestamp**.
+- **Tail loss probe.** The last packets of a round have nothing after them to
+  reveal a loss, and the tail is exactly what step time measures. The probe
+  timer fires at `last_send + srtt + max(4·rttvar, 2 ms) + 2.5 ms`, about
+  1.1 × RTT (≈ 110 ms in sim, ≈ 1.1 ms real), but not while the flow still has
+  data waiting to be paced out. A probe resends the **newest** unacked segment
+  with the `PROBE` flag, immediately. Its ACK's cumulative ack and SACK blocks
+  show exactly what else is missing.
+- **Backoff during outages.** Consecutive probes double the timer, capped at
+  4 × srtt; any new ACK resets it. During a blackout each flow sends one probe
+  per interval, not a window of retransmits.
+- **Random loss: what we didn't build.** Recovery is at the RACK floor: any
+  loss costs about one RTT, so a small round that loses a packet lands near
+  2.3× the ideal, and one that loses a retransmission too lands near 5×.
+  Duplicating retransmissions or adding parity packets (FEC) would cut that,
+  but datacenter transports generally don't: real datacenter loss is mostly
+  congestion (which pacing and delay feedback prevent), links already correct
+  bit errors with link-layer FEC, and a lossy link is routed around. We've left
+  these out unless the graded workloads turn out to need them.
 
 ### 5.5 Receiver
 
 On every data packet:
 
-1. Add `[seq, seq + len)` to the flow's received range set. If the message
-   isn't already complete, copy the payload into that message's buffer at
-   `offset`.
-2. When the message's received intervals cover `[0, total)` (total known once
-   the `END` packet arrives), call `self.deliver(msg_id, bytes)`, mark it done,
-   and free the buffer. This doesn't wait for earlier messages in the stream.
-3. **Always ACK**, including for duplicates. A lost ACK must never wedge the
-   sender. The ACK carries the cumulative ack (end of the first contiguous
-   range), receive window, up to `MAX_SACK` blocks for ranges above it (newest
-   first), echo timestamp, and forward OWD.
+1. Add `[seq, seq + data bytes)` to the flow's received range set.
+2. For each frame whose message isn't already complete, store the piece at
+   `offset`. When a message's received intervals cover `[0, total)` (total
+   known once its `END` piece arrives), call `self.deliver(msg_id, bytes)`,
+   mark it done, and free its buffer. This doesn't wait for other messages.
+3. **Always ACK**, including duplicates, or a lost ACK could wedge the sender.
+   The ACK carries the cumulative ack (end of the first contiguous range), the
+   receive window, up to `MAX_SACK` blocks above it, the echo timestamp, and
+   the forward OWD.
 
 ## 6. Overhead budget
 
@@ -292,95 +345,94 @@ datagram:
 |---|---|---|
 | payload | 1400 | 1.000 |
 | IP/UDP | 28 | 0.020 |
-| our data header | 16 | 0.011 |
+| our data header (9 + one 9-byte frame) | 18 | 0.013 |
 | ACK (28 + 14, no SACK blocks) | 42 | 0.030 |
-| **Total, no loss** | **1486** | **≈ 1.061** |
+| **Total, no loss** | **1488** | **≈ 1.063** (measured: 1.063) |
 | Budget | 1820 | 1.30 |
 
 That leaves about **330 B per message, or ~22% of packets, for
-retransmissions and probes**. Moving to ack-every-2 would bring the no-loss
-figure to about 1.05.
+retransmissions and probes**.
 
-**Small messages are the risk.** A 100-byte message sent alone costs
-100 + 16 + 28 + 42 = 186 B, a ratio of 1.86, which fails. If the graded
-workloads use small messages, we'd add a packet format that packs several
-messages to the same receiver into one datagram (a per-message
-`msg_id`/offset/length entry each), plus ack-every-2. That would bring the
-ratio to roughly 1.15. Not planned for v1; the basic workload uses 1400-byte
-messages.
+**Small messages:** sent alone, a 100-byte message would cost
+100 + 18 + 28 + 42 = 188 B (1.88). Packed 13 to a packet, with one ACK per
+packet, the measured ratio is **1.16**.
 
-## 7. Implementation plan
+## 7. Implementation
 
 The course only accepts `protocol.py`, so all of the code lives in that one
 file, organized into sections:
 
-1. **Constants / topology**: `RACK_SIZE = 3`, link rates, target delay, PTO
-   floor, `rack_of(name)`.
-2. **Codec**: `struct` definitions and `pack_data`, `unpack_data`, `pack_ack`,
-   `unpack_ack`. Unit tests round-trip them.
-3. **`RangeSet`**: sorted disjoint intervals with add, contains, and
-   `gaps_above(x)`. Used for received stream bytes, SACK, and message byte
-   coverage.
-4. **`FlowTx`**: per-flow sender state, packer, loss detection, and the rate
-   controller.
-5. **`MySender`**: flush timer, pacer timer, probe timer (one timer for the
-   earliest flow deadline), and ACK handling.
-6. **`MyReceiver`**: reassembly, delivery, ACK generation.
+1. **Constants / topology**: link rates, rack size, `rack_of(name)`, ACK room,
+   rate-control and loss-detection parameters (each commented with why).
+2. **Codec**: `pack_data` / `unpack_data` (header + frames), `pack_ack` /
+   `unpack_ack`. Unit tests in `tests/test_protocol.py` round-trip them and
+   check packing.
+3. **`RangeSet`**: sorted disjoint intervals. Used for received stream bytes,
+   SACK, and message byte coverage.
+4. **`FlowTx`**: per-flow sender state, packing, RACK loss detection, the
+   probe timeout, and the rate controller (`on_delay`, `start_round`).
+5. **`MySender`**: flush, starting rates, the pacer, probe timers (one per
+   flow), ACK handling.
+6. **`MyReceiver`**: frame parsing, reassembly, delivery, ACK generation.
 
-Milestones (each must keep reliability = 1.0 on everything that passed
-before):
+Status:
 
-| # | Milestone | Done when |
-|---|---|---|
-| M1 | Codec + framing + 0-RTT send-all + receiver reassembly + per-packet ACK + RTO retransmit | basic_workload: reliability 1.0. Slowdown is probably already < 2.5 (no handshake; 32 pkts per sender fit in the queues) |
-| M2 | Pacer with topology prior | medium/large bursts: zero drops at rack uplinks (check `sim-stats.json` / `VIS=1`) |
-| M3 | SACK + fast retransmit + PTO + backoff | loss_burst and blackout workloads: reliability 1.0, overhead < 1.3 |
-| M4 | Delay-based feedback | bw_change and jitter_s workloads stay < 2.5 |
-| M5 | Overhead tuning (ack-every-2, SACK cap, tail redundancy only if needed) and parameter sweep | full test matrix passes, worst of 5 seeds |
+| Piece | Status |
+|---|---|
+| Codec, framing, reassembly, per-packet ACK, RTO | done (Ellis) |
+| SACK + RACK loss detection, tail-loss probe, backoff | done (Ellis); adaptive reordering window added later |
+| Pacer with topology starting rates, retransmissions first | done |
+| Delay-feedback rate control, carried across rounds | done |
+| Packing several messages per packet | done |
+| Room for ACKs on the spine links | done |
+| Ack-every-2 | not needed so far |
+| Redundancy for random loss (duplicate retransmissions, FEC) | not built; see §5.4 |
 
-## 8. Test plan
+## 8. Test plan and current results
 
-Custom workloads go in `workloads/` (copied from `workload.yaml`) and run with
-`make run SCENARIO=datacenter WORKLOAD=workloads/<name>.yaml SEED=n`. A small
-script (`tools/sweep.py`) runs every workload with seeds 1–5 and prints the
-**worst** value of each metric, which is how grading works.
+Custom workloads live in `workloads/` and run with
+`make run SCENARIO=datacenter WORKLOAD=workloads/<name>.yaml SEED=n`.
+`tools/sweep.py` runs every workload with seeds 1–5 and prints the **worst**
+value of each metric, which is how grading works. Only `basic` is an official
+workload; the rest are our guesses at what "harder" graded workloads contain,
+built from every event type the harness supports.
 
-| Workload | Setup | What it checks | Ideal (approx.) |
-|---|---|---|---|
-| basic | given: 2 rounds, 5.6 KB/pair | correctness, 0-RTT | 55 ms |
-| medium incast | `burst_bytes: 28000`, 5 rounds | pacing in the first RTT (would overflow queues unpaced) | 77 ms |
-| large incast | `burst_bytes: 140000`, 5 rounds | multi-RTT; feedback loop; no slow-start penalty | 187 ms |
-| small msgs | `msg_bytes: 100` | overhead with small messages (decides whether we need packing) | – |
-| large msgs | `msg_bytes: 64000` | fragmentation / reassembly | – |
-| random loss | + `loss_burst` 1%, 5%, 10% on `rack0-spine` during rounds | SACK, PTO, overhead under retransmits | – |
-| server failure | + `blackout` on `sender4-rack1` and `rack1-receiver4` for 1 s | backoff, recovery, no wasted overhead | ideal waits for recovery |
-| slow spine | + `bw_change` `rack1-spine` → 75 Mbps | feedback corrects a wrong prior | rises with the change |
-| jitter / reordering | + `delay_change` with `jitter_ms: 5` | reorder tolerance (no spurious retransmits) | – |
-| staggered starts | incast with `jitter_s: 0.02` | prior isn't stuck assuming everyone is active | – |
+| Workload | Setup | What it checks | Slowdown | Overhead | Pass |
+|---|---|---|---|---|---|
+| basic | given: 2 rounds, 5.6 KB/pair | correctness, 0-RTT | 1.03 | 1.06 | ✅ |
+| medium_incast | 28 KB/pair, 5 rounds | pacing in the first RTT | 1.03 | 1.06 | ✅ |
+| large_incast | 140 KB/pair, 5 rounds | multi-RTT rounds; ACK room | 1.05 | 1.06 | ✅ |
+| small_msgs | 100-byte messages | packing; overhead | 1.01 | 1.16 | ✅ |
+| large_msgs | 64 KB messages | splitting / reassembly | 1.05 | 1.06 | ✅ |
+| staggered | incast with `jitter_s: 0.02` | starts that aren't simultaneous | 1.21 | 1.06 | ✅ |
+| jitter | `delay_change` ±5 ms on a spine link | reordering; jitter filter | 1.08 | 1.07 | ✅ |
+| server_failure | `blackout` of server 4's links for 1 s | backoff and recovery | 1.13 | 1.12 | ✅ |
+| slow_spine | `bw_change` rack1–spine → 75 Mbps | delay feedback; carried rate | 2.01 | 1.10 | ✅ |
+| loss_1 | 1% `loss_burst` on rack0–spine | loss recovery | 2.85 | 1.07 | ❌ (typical lossy round ≈ 2.27; one unlucky round fails it) |
+| loss_server_link | 5% loss on one server's downlink | loss recovery | 3.27 | 1.07 | ❌ |
+| loss_5 / loss_10 | 5% / 10% loss on rack0–spine | loss recovery | 4.53 / 7.24 | 1.10 / 1.13 | ❌ |
 
-What we watch in each run: the three graded metrics, per-round `slowdown` and
-`undelivered` in `results.json`, queue drops in `sim-stats.json`, queue depth
-over time in `VIS=1`, and retransmit counts from our own `self.log`.
+Reliability is 1.0 on every workload and seed. What we watch in each run: the
+three graded metrics, per-round `slowdown` in `results.json`, queue drops
+(`qdrops` in the sweep), and the per-flow lines the sender logs at each round
+start and at the end (rate, carried rate, cuts, retransmissions).
 
 ## 9. Risks and open questions
 
-- **Hardcoding the topology prior.** We assume the operator knows its own
-  backbone, which is reasonable for a datacenter. If the graded workloads are far
-  from uniform all-to-all, the prior is wrong for about 1 RTT until feedback
-  fixes it. Fallback: start every flow at `NIC / active_flows`, which is
-  safe for the receiver downlinks but 1.5× too fast for the spine, and rely on
-  feedback.
-- **Tail latency on small rounds.** With a 55 ms ideal, any retransmission of a
-  round's last packet costs more than 2.5× for that round. Only the mean has to
-  pass, but a long `loss_burst` across many small rounds could still fail it.
-  That's what the optional tail redundancy is for.
-- **ACKs share the bottleneck.** ACKs for cross-rack data cross the
-  rack→spine links in the opposite direction from the data, and those same
-  links carry other traffic. They take about 3% of capacity and can be dropped
-  at the 64-packet queue. Ack-every-2 helps here too.
-- **Python timer cost.** With one pacer tick per datagram, large workloads
-  mean tens of thousands of callbacks. That's fine in simulated time, but we
-  should check wall-clock run time. Sending a small batch per tick is a cheap fix.
+- **Hardcoding the topology.** We assume the operator knows its own backbone,
+  which is reasonable for a datacenter. If the graded workloads are far from
+  uniform all-to-all, the starting rate is wrong for about one RTT until
+  feedback lowers it.
+- **Unused capacity.** The rate never goes above the topology share, so when
+  fewer servers are sending than all-to-all assumes, we leave capacity unused.
+  Using it would need a signal for spare capacity, which an empty queue can't
+  give.
+- **Random loss.** See §5.4: loss above ~1%, or an unlucky round at 1%, fails
+  the slowdown bound. Whether that matters depends on the graded workloads.
+- **No in-flight cap.** During a blackout, new data is still paced out into
+  the dead link, which costs overhead (server_failure: 1.12, under budget).
+- **Python timer cost.** One pacer tick per datagram; the full sweep (13
+  workloads × 5 seeds) takes about 25 s of wall time, so this is fine.
 
 ## 10. Division of work
 
