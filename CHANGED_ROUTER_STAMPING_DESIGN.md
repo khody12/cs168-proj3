@@ -93,7 +93,8 @@ tell them apart. We make up for it in two ways:
   (from the scenario file), so each sender starts each flow at its fair share
   of the busiest link, instead of guessing or using slow start. This is
   important because most rounds are short enough to finish before the first
-  feedback arrives.
+  feedback arrives. See
+  [CHANGED_SLOW_START_DESIGN.md](CHANGED_SLOW_START_DESIGN.md).
 - **Probe upward quickly.** If queueing stays at zero and we still have data to
   send, we raise the rate fast until queues just start to form.
 
