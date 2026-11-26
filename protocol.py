@@ -63,6 +63,21 @@ LOSS_TIME_MIN_S = 0.001    # slack for ACK spacing and timer granularity
 SPURIOUS_RTT_FRAC = 0.8    # a retransmission "acked" faster than this * min_rtt
                            # must have been acked by the original: reordering
 TIMER_FLOOR_S = 0.0001
+# Send a retransmission or tail-loss probe as two copies when the loss looks
+# random rather than congestive. A lost retransmission costs a second round
+# trip (the round then takes ~5x its ideal); two copies are both lost only
+# with probability loss^2. Only retransmissions are doubled, so a network that
+# isn't losing packets pays nothing. Not doubled:
+#  - congestion losses (standing queueing delay over target when the loss was
+#    detected): an extra copy would add load to the link that's overflowing;
+#  - backed-off probes: the path has gone silent (a failed server, say), and
+#    a second copy into it is wasted;
+#  - bursts: random loss is scattered, so when DUP_MAX_BURST or more of a
+#    flow's segments are waiting for retransmission at once, it was an outage
+#    or an overflow (a dead link has no queue either), and doubling them all
+#    would just add a burst of load as the path comes back.
+DUP_RETX = True
+DUP_MAX_BURST = 3
 
 # Topology, from scenarios/datacenter/scenario.yaml. The protocol isn't told
 # any of this at runtime; it stands in for the hop records' link-bandwidth
@@ -251,7 +266,7 @@ class RangeSet:
 # ---------------------------------------------------------------------------
 
 class Seg:
-    __slots__ = ("seq", "frames", "nbytes", "sent_at", "tx", "pn", "in_retxq")
+    __slots__ = ("seq", "frames", "nbytes", "sent_at", "tx", "pn", "in_retxq", "dup")
 
     def __init__(self, seq, frames):
         self.seq = seq
@@ -261,6 +276,7 @@ class Seg:
         self.tx = 0
         self.pn = -1          # packet number of the latest transmission
         self.in_retxq = False  # declared lost, waiting in the flow's retx queue
+        self.dup = False       # resend as two copies (loss looked random)
 
     @property
     def hi(self):
@@ -311,6 +327,7 @@ class FlowTx:
         self.min_prev_us: int | None = None  # two half-window buckets
         self.min_epoch = 0.0
         self.q_samples: deque[tuple[float, float]] = deque()  # (time, q)
+        self.standing_q: float | None = None  # latest standing queueing delay
         self.cuts = 0
 
     def pending(self) -> bool:
@@ -352,6 +369,7 @@ class FlowTx:
         if len(samples) < STANDING_SAMPLES:
             return
         q = min(v for _, v in samples)
+        self.standing_q = q
 
         if q > TARGET_DELAY_S:
             # Over target: cut, harder the further over, once per RTT.
@@ -396,6 +414,18 @@ class FlowTx:
         self.best_run_bytes, self.best_run_rate = 0, 0.0
         self.share_bps = share_bps
         self.rate_bps = min(share_bps, self.carry_bps or share_bps)
+
+    def loss_looks_random(self) -> bool:
+        """True if the path had no standing queue when the loss was detected:
+        the drop wasn't an overflowing queue, so it was random."""
+        return self.standing_q is not None and self.standing_q <= TARGET_DELAY_S
+
+    def tail(self) -> Seg:
+        """The highest unacked segment. Nothing sent after it can reveal its
+        loss, so the probe timer watches it: counting from the flow's last
+        send instead would let an earlier hole's retransmission push the
+        tail's deadline back a whole round trip."""
+        return self.unacked[max(self.unacked)]
 
     def real_losses(self) -> int:
         return self.retx - self.spurious
@@ -557,7 +587,7 @@ class MySender(Sender):
 
     # ---- pacer ---------------------------------------------------------------
 
-    def _send_seg(self, f: FlowTx, s: Seg, probe=False):
+    def _send_seg(self, f: FlowTx, s: Seg, probe=False, copies=1):
         t = self.now()
         s.sent_at = t
         s.tx += 1
@@ -567,9 +597,10 @@ class MySender(Sender):
         if s.tx > 1:
             f.retx += 1
         pkt = pack_data(s.seq, now_us(t), s.frames, probe)
-        self.nic_free_at = max(self.nic_free_at, t) + wire_bits(len(pkt)) / NIC_BPS
-        self.send_datagram(pkt, to=f.dst)
-        return len(pkt)
+        for _ in range(copies):
+            self.nic_free_at = max(self.nic_free_at, t) + wire_bits(len(pkt)) / NIC_BPS
+            self.send_datagram(pkt, to=f.dst)
+        return len(pkt) * copies
 
     def _pick(self, now: float):
         """Next (flow, is_retx) to send, or (None, False). Retransmissions go
@@ -600,7 +631,7 @@ class MySender(Sender):
             else:
                 s = f.queue.pop(0)
                 f.unacked[s.seq] = s
-            nbytes = self._send_seg(f, s)
+            nbytes = self._send_seg(f, s, copies=2 if retx and s.dup else 1)
             f.next_send = max(f.next_send, now) + wire_bits(nbytes) / f.rate_bps
             if not self.timer_pending("pto:" + f.dst):
                 self._arm(f)
@@ -628,14 +659,14 @@ class MySender(Sender):
 
     def _arm(self, f: FlowTx):
         """One timer per flow: the earlier of the next time-threshold loss
-        and the probe timeout (measured from the last send)."""
+        and the probe timeout (measured from when the flow's tail was sent)."""
         name = "pto:" + f.dst
         if not f.unacked:
             self.cancel_timer(name)
             return
         now = self.now()
         _, loss_at = f.detect_lost(now)
-        at = f.last_send + f.pto()
+        at = f.tail().sent_at + f.pto()
         if loss_at is not None:
             at = min(at, loss_at)
         # Floor keeps float rounding from spinning a zero-delay timer.
@@ -646,9 +677,12 @@ class MySender(Sender):
         new data. True if anything is lost."""
         lost, _ = f.detect_lost(self.now())
         added = False
+        burst = len(f.retxq) + sum(1 for s in lost if not s.in_retxq)
+        dup = DUP_RETX and burst < DUP_MAX_BURST and f.loss_looks_random()
         for s in sorted(lost, key=lambda s: s.seq):
             if not s.in_retxq:
                 s.in_retxq = True
+                s.dup = dup
                 f.retxq.append(s)
                 added = True
         if added:
@@ -684,16 +718,28 @@ class MySender(Sender):
                 return
             if not self._recover(f):
                 now = self.now()
-                if f.pending() or now < f.last_send + f.pto() - PACE_EPS_S:
+                tail = f.tail()
+                if f.pending() or now < tail.sent_at + f.pto() - PACE_EPS_S:
                     # Still sending (or sent recently): there's no tail yet
                     # to probe, so just look again later.
                     self._arm(f)
                     return
                 # Tail-loss probe: nothing is provably lost, so resend the
-                # newest unacked segment. Its ACK's cum/SACK shows exactly
-                # what else is missing, and detection takes it from there.
-                newest = max(f.unacked.values(), key=lambda s: s.pn)
-                self._send_seg(f, newest, probe=True)
+                # flow's tail (its highest unacked segment, which nothing sent
+                # later can reveal). Its ACK's cum/SACK shows exactly what
+                # else is missing, and detection takes it from there.
+                # Everything still unacked was sent before the tail, so it's
+                # all overdue too: if that's only a few segments (scattered
+                # loss, e.g. the last two packets both lost), resend them all
+                # rather than spending a round trip finding the next one.
+                # Many outstanding means an outage: probe with the tail only.
+                if len(f.unacked) < DUP_MAX_BURST:
+                    probes = sorted(f.unacked.values(), key=lambda s: s.seq)
+                else:
+                    probes = [tail]
+                dup = DUP_RETX and f.backoff == 0 and f.loss_looks_random()
+                for seg in probes:
+                    self._send_seg(f, seg, probe=True, copies=2 if dup else 1)
                 f.backoff = min(f.backoff + 1, 6)
             self._arm(f)
 

@@ -20,6 +20,9 @@ Short, high-level explanations of the biggest changes:
 - [CHANGED_SLOW_START_DESIGN.md](CHANGED_SLOW_START_DESIGN.md): why slow start
   doesn't work here, and how we pick and pace the starting rate from the
   topology
+- [CHANGED_LOSS_RECOVERY_DESIGN.md](CHANGED_LOSS_RECOVERY_DESIGN.md): why one
+  lost packet nearly costs a round, and how we detect, probe for and resend
+  losses (including two copies when the loss looks random)
 
 The course's setup and run instructions are at the [bottom](#course-setup-and-running).
 
@@ -109,6 +112,7 @@ drops is a retransmission (overhead) and probably an extra RTT on the tail
 | Receive window | **Kept, in ACKs only** | Never binding in the simulator, but a real receiver needs flow control. |
 | Up to 15 SACK blocks × 8 B | **Same format; the receiver includes at most `MAX_SACK` = 4** | We ACK every packet, so older holes were already reported in earlier ACKs. Fewer blocks keep ACKs small during loss. |
 | One header for data and ACKs | **Separate data and ACK headers** sharing the flags byte | Senders and receivers are separate endpoints, so data packets never carry ACK info and ACKs never carry data. |
+| SACK + short retransmit timer (tradeoffs #2, #5) | **Kept, plus:** RACK loss detection, a tail-loss probe timed from each flow's last segment, and two copies of a retransmission when the loss looks random | One lost packet already makes a small round ~2.3× its ideal, and a second loss ~5×. See [CHANGED_LOSS_RECOVERY_DESIGN.md](CHANGED_LOSS_RECOVERY_DESIGN.md). |
 | Immediate ack for every packet | **Kept** | Costs about 3% overhead (§6). We have the budget, and every ACK is a fresh delay sample for the rate controller. Ack-every-2 hasn't been needed. |
 | One message per packet (implied) | **Packets carry "frames"**: one or more `(msg_id, offset, length, END)` pieces | Small messages share a packet's headers and its ACK (100-byte messages: overhead 1.86 → 1.16). Large messages are split across packets. Each message is delivered as soon as its own pieces arrive. |
 
@@ -303,24 +307,46 @@ Alternatives we tried and dropped (each measured on the sweep):
 - **Retransmissions** wait in the flow's retransmission queue and the pacer
   sends them before new data, with the **same sequence number and a fresh send
   timestamp**.
-- **Tail loss probe.** The last packets of a round have nothing after them to
-  reveal a loss, and the tail is exactly what step time measures. The probe
-  timer fires at `last_send + srtt + max(4·rttvar, 2 ms) + 2.5 ms`, about
-  1.1 × RTT (≈ 110 ms in sim, ≈ 1.1 ms real), but not while the flow still has
-  data waiting to be paced out. A probe resends the **newest** unacked segment
-  with the `PROBE` flag, immediately. Its ACK's cumulative ack and SACK blocks
-  show exactly what else is missing.
+- **Tail loss probe, timed from the tail.** The flow's highest unacked
+  segment (its *tail*) has nothing after it to reveal a loss, and the tail is
+  exactly what step time measures. The probe timer fires at
+  `tail.sent_at + srtt + max(4·rttvar, 2 ms) + 2.5 ms`, about 1.1 × RTT
+  (≈ 110 ms in sim, ≈ 1.1 ms real), but not while the flow still has data
+  waiting to be paced out. It counts from the tail's own send time, not the
+  flow's last send of anything: otherwise retransmitting an earlier hole
+  pushed the tail's deadline back a whole RTT.
+  - A probe resends, immediately and with the `PROBE` flag: **all**
+    unacked segments if there are fewer than `DUP_MAX_BURST` (3), since they
+    were all sent before the tail and are all overdue (this catches a flow
+    losing its last two packets); otherwise just the tail. Its ACK's
+    cumulative ack and SACK blocks show exactly what else is missing.
 - **Backoff during outages.** Consecutive probes double the timer, capped at
   4 × srtt; any new ACK resets it. During a blackout each flow sends one probe
   per interval, not a window of retransmits.
-- **Random loss: what we didn't build.** Recovery is at the RACK floor: any
-  loss costs about one RTT, so a small round that loses a packet lands near
-  2.3× the ideal, and one that loses a retransmission too lands near 5×.
-  Duplicating retransmissions or adding parity packets (FEC) would cut that,
-  but datacenter transports generally don't: real datacenter loss is mostly
-  congestion (which pacing and delay feedback prevent), links already correct
-  bit errors with link-layer FEC, and a lossy link is routed around. We've left
-  these out unless the graded workloads turn out to need them.
+- **Two copies when the loss looks random** (`DUP_RETX`). Recovery has a
+  floor: any loss costs about one RTT, so a small round that loses a packet
+  lands near 2.3× the ideal, and one that loses the retransmission too lands
+  near 5×. So a retransmission (or a first probe) goes out as **two copies**,
+  both lost only with probability loss², unless:
+  - the flow had a **standing queue** over target when the loss was detected:
+    it was a congestion drop, and an extra copy adds load to the overflowing
+    link;
+  - **`DUP_MAX_BURST` (3) or more** of the flow's segments are lost at once:
+    random loss is scattered, so a burst means an outage (a dead link has no
+    queue either, so the first check can't catch it), and doubling a whole
+    burst floods the path as it comes back;
+  - it's a **backed-off probe** into a path that has gone silent.
+
+  Only retransmissions are doubled, so a clean network pays nothing.
+  Doubling everything helped loss but made slow_spine (2.01 → 2.15) and
+  server_failure (1.13 → 1.29) worse; the three exceptions removed exactly
+  that damage. See
+  [CHANGED_LOSS_RECOVERY_DESIGN.md](CHANGED_LOSS_RECOVERY_DESIGN.md).
+- **Not built: parity packets (FEC).** They'd rebuild a lost packet with no
+  round trip and help at 5–10% loss, but datacenter transports generally don't
+  use them: real datacenter loss is mostly congestion (which pacing and delay
+  feedback prevent), links already correct bit errors with link-layer FEC, and
+  a lossy link is routed around.
 
 ### 5.5 Receiver
 
@@ -386,7 +412,9 @@ Status:
 | Packing several messages per packet | done |
 | Room for ACKs on the spine links | done |
 | Ack-every-2 | not needed so far |
-| Redundancy for random loss (duplicate retransmissions, FEC) | not built; see §5.4 |
+| Tail probe timed from the tail; probe all of a few outstanding segments | done |
+| Two copies of retransmissions for random-looking losses | done |
+| Parity packets (FEC) | not built; see §5.4 |
 
 ## 8. Test plan and current results
 
@@ -408,9 +436,9 @@ built from every event type the harness supports.
 | jitter | `delay_change` ±5 ms on a spine link | reordering; jitter filter | 1.08 | 1.07 | ✅ |
 | server_failure | `blackout` of server 4's links for 1 s | backoff and recovery | 1.13 | 1.12 | ✅ |
 | slow_spine | `bw_change` rack1–spine → 75 Mbps | delay feedback; carried rate | 2.01 | 1.10 | ✅ |
-| loss_1 | 1% `loss_burst` on rack0–spine | loss recovery | 2.85 | 1.07 | ❌ (typical lossy round ≈ 2.27; one unlucky round fails it) |
-| loss_server_link | 5% loss on one server's downlink | loss recovery | 3.27 | 1.07 | ❌ |
-| loss_5 / loss_10 | 5% / 10% loss on rack0–spine | loss recovery | 4.53 / 7.24 | 1.10 / 1.13 | ❌ |
+| loss_1 | 1% `loss_burst` on rack0–spine | loss recovery | 2.35 | 1.07 | ✅ |
+| loss_server_link | 5% loss on one server's downlink | loss recovery | 2.52 | 1.08 | ❌ (just over) |
+| loss_5 / loss_10 | 5% / 10% loss on rack0–spine | loss recovery | 2.92 / 3.86 | 1.12 / 1.18 | ❌ |
 
 Reliability is 1.0 on every workload and seed. What we watch in each run: the
 three graded metrics, per-round `slowdown` in `results.json`, queue drops
@@ -427,8 +455,10 @@ start and at the end (rate, carried rate, cuts, retransmissions).
   fewer servers are sending than all-to-all assumes, we leave capacity unused.
   Using it would need a signal for spare capacity, which an empty queue can't
   give.
-- **Random loss.** See §5.4: loss above ~1%, or an unlucky round at 1%, fails
-  the slowdown bound. Whether that matters depends on the graded workloads.
+- **Random loss.** See §5.4: 1% passes; 5% on a single link is just over the
+  bound, and 5–10% on a spine link fails it (many rounds still need two round
+  trips). Getting further would take parity packets. Whether that matters
+  depends on the graded workloads.
 - **No in-flight cap.** During a blackout, new data is still paced out into
   the dead link, which costs overhead (server_failure: 1.12, under budget).
 - **Python timer cost.** One pacer tick per datagram; the full sweep (13
